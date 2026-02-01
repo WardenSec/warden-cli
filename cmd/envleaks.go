@@ -16,6 +16,10 @@ var envleaksCmd = &cobra.Command{
 	RunE:  runEnvleaks,
 }
 
+func init() {
+	rootCmd.AddCommand(envleaksCmd)
+}
+
 func runEnvleaks(cmd *cobra.Command, args []string) error {
 	targetURL := args[0]
 

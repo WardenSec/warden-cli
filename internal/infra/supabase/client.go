@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"warden/cli/internal/domain"
+	"warden/internal/domain"
 )
 
 // ManagementClient interacts with the Supabase Management API.

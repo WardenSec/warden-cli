@@ -7,7 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"warden/cli/internal/domain"
+	"warden/internal/domain"
 
 	pg_query "github.com/pganalyze/pg_query_go/v5"
 )

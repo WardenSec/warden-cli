@@ -3,7 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"warden/cli/internal/domain"
+	"warden/internal/domain"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -179,9 +179,9 @@ func (r *PostgresRepository) GetStoragePolicies(ctx context.Context) ([]domain.S
 		SELECT
 			p.polname,
 			COALESCE(
-				(SELECT name FROM storage.buckets WHERE id::text = 
-					CASE 
-						WHEN pg_get_expr(p.polqual, p.polrelid) LIKE '%bucket_id%' 
+				(SELECT name FROM storage.buckets WHERE id::text =
+					CASE
+						WHEN pg_get_expr(p.polqual, p.polrelid) LIKE '%bucket_id%'
 						THEN regexp_replace(pg_get_expr(p.polqual, p.polrelid), '.*bucket_id[^'']*''([^'']+)''.*', '\1')
 						ELSE ''
 					END

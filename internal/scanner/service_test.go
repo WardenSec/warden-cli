@@ -5,8 +5,8 @@ import (
 	"io/ioutil"
 	"os"
 	"testing"
-	"warden/cli/internal/domain"
-	"warden/cli/internal/scanner"
+	"warden/internal/domain"
+	"warden/internal/scanner"
 
 	pg_query "github.com/pganalyze/pg_query_go/v5"
 )

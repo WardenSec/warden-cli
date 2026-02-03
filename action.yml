@@ -1,0 +1,92 @@
+name: "Warden Security Scan"
+description: "Scan Supabase projects for security vulnerabilities"
+author: "Warden Security"
+
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  repo:
+    description: "Repository path (default: current directory)"
+    required: false
+    default: "."
+  migrations-path:
+    description: "Path to migration files within the repo"
+    required: false
+    default: "supabase/migrations"
+  db:
+    description: "Database connection string for live scanning"
+    required: false
+  project-ref:
+    description: "Supabase project reference ID for API checks"
+    required: false
+  access-token:
+    description: "Supabase access token for API checks"
+    required: false
+  format:
+    description: "Output format (json, sarif, text)"
+    required: false
+    default: "sarif"
+  fail-on:
+    description: "Fail if vulnerabilities at this severity or higher are found"
+    required: false
+    default: "HIGH"
+
+outputs:
+  vulnerabilities:
+    description: "Number of vulnerabilities found"
+    value: ${{ steps.scan.outputs.count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.21"
+
+    - name: Install Warden
+      shell: bash
+      run: |
+        go install github.com/wardensec/warden-cli@latest || {
+          echo "Installing from source..."
+          cd ${{ github.action_path }}
+          go build -o /usr/local/bin/warden ./cmd/cli
+        }
+
+    - name: Run Warden Scan
+      id: scan
+      shell: bash
+      run: |
+        ARGS="--repo ${{ inputs.repo }} --migrations-path ${{ inputs.migrations-path }} --format ${{ inputs.format }}"
+        
+        if [ -n "${{ inputs.db }}" ]; then
+          ARGS="$ARGS --db '${{ inputs.db }}'"
+        fi
+        
+        if [ -n "${{ inputs.project-ref }}" ] && [ -n "${{ inputs.access-token }}" ]; then
+          ARGS="$ARGS --project-ref ${{ inputs.project-ref }} --access-token ${{ inputs.access-token }}"
+        fi
+        
+        if [ -n "${{ inputs.fail-on }}" ]; then
+          ARGS="$ARGS --fail-on ${{ inputs.fail-on }}"
+        fi
+        
+        warden scan $ARGS > warden-results.${{ inputs.format }} 2>&1 || true
+        
+        # Count vulnerabilities
+        COUNT=$(cat warden-results.${{ inputs.format }} | grep -c '"id":' || echo "0")
+        echo "count=$COUNT" >> $GITHUB_OUTPUT
+        
+        # Display results
+        cat warden-results.${{ inputs.format }}
+        
+        # Check threshold
+        warden scan $ARGS
+
+    - name: Upload SARIF (if applicable)
+      if: ${{ inputs.format == 'sarif' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: warden-results.sarif

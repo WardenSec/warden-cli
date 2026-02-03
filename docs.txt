@@ -1,0 +1,157 @@
+﻿1. Introduction: The Paradigm Shift in Backend Security
+The evolution of modern web development has seen a marked transition from traditional three-tier architectures—comprising a client, a stateless application server, and a database—toward "Backend-as-a-Service" (BaaS) models that collapse the middle tier. Supabase, positioned as an open-source alternative to Firebase, exemplifies this shift by leveraging the robustness of PostgreSQL to provide a suite of integrated services including real-time subscriptions, authentication, file storage, and auto-generated RESTful APIs via PostgREST.1 While this architecture dramatically accelerates development velocity by handling infrastructure boilerplate, it fundamentally alters the security threat landscape. In a traditional model, an application server acts as an explicit gatekeeper, sanitizing inputs and enforcing authorization logic before any query reaches the database. In the Supabase model, the database is the gatekeeper. The frontend communicates directly with the database via APIs that expose the schema to the public internet, relying entirely on PostgreSQL's internal security primitives—specifically Row Level Security (RLS)—to separate users from data they should not access.3
+This architectural inversion places an unprecedented burden on the correct configuration of the database. Security is no longer a matter of writing secure controller logic in Python or Node.js; it is now a matter of writing secure SQL policies and configuring complex system privileges.3 The implications are severe: a single misconfiguration in a PostgreSQL policy or a forgotten RLS enablement command can result in the immediate, unmitigated exfiltration of an entire dataset.5 Recent security research indicates that hundreds to thousands of Supabase instances are deployed with critical misconfigurations, such as public APIs enabling powerful query filters like neq (not equal) or gt (greater than) on sensitive tables without adequate restriction, effectively allowing attackers to dump database contents with trivial effort.5
+Furthermore, in a modern development workflow, these configurations are often defined as "Infrastructure-as-Code" via SQL migration files. Security is thus a two-front battle: auditing the "live" state of the database and auditing the "desired" state defined in the codebase. Consequently, there is a critical need for specialized tooling capable of auditing this unique environment. A generic vulnerability scanner is insufficient; a purpose-built scanner must be capable of deep interrogation of PostgreSQL system catalogs, analysis of GoTrue authentication settings, and static analysis of the migration files themselves.
+This report details the architectural design and technical specifications for building such a vulnerability scanner using the Go programming language and the Cobra CLI library.7 Go is selected for its static typing, high concurrency capabilities, and its ability to compile into a single, portable binary.8 The design prioritizes a "Clean Architecture" approach, ensuring that the core scanning logic is decoupled from the command-line interface and the specific storage sources (Database vs. GitHub), thereby facilitating a seamless future transition to a scalable web backend or a continuous integration (CI) service.9
+2. Architectural Design Principles for a Dual-Target Security Tool
+To satisfy the requirement of building a CLI tool that supports a future transition to a web backend while providing access to both live databases and GitHub repositories, the software architecture must rigorously separate concerns.9
+2.1. The Clean Architecture Approach in Go
+The application structure follows the principles of Hexagonal Architecture, dividing the codebase into distinct layers: Domain, Usecase, Interface Adapters, and Infrastructure.9
+2.1.1. The Domain Layer
+The Domain layer defines the fundamental entities such as a Vulnerability, a ScanReport, and a MigrationScript. This layer contains no code related to SQL, GitHub APIs, or CLI formatting. It is pure Go data structures.9
+2.1.2. The Usecase Layer
+The Usecase layer contains the "business logic." It defines interfaces for the external resources it needs. For example, a SourceCodeRepository interface would define methods like GetMigrationFiles(), while a DatabaseRepository would define GetLivePolicies(). This allows the logic to remain identical whether it is reading files from a local disk, a cloned GitHub repo, or querying a live Supabase instance.
+2.1.3. The Infrastructure Layer
+The Infrastructure layer provides concrete implementations of the interfaces:
+* PostgreSQL Adapter: Uses the pgx library to connect to the live Supabase instance.16
+* Git Adapter: Uses the go-git library to clone repositories programmatically from GitHub using user-provided credentials (e.g., OAuth tokens).
+* Static Analysis Adapter: Uses libraries like pg_query_go to parse SQL migration files into an Abstract Syntax Tree (AST) for inspection without executing the code.
+2.2. Directory Structure Recommendation
+
+
+Directory
+	Purpose
+	Transition Relevance
+	/cmd/cli
+	The Cobra CLI entry point.7
+	Can coexist with /cmd/server for the future web backend.
+	/internal/domain
+	Core business objects (e.g., Vulnerability).
+	Shared logic across all entry points.
+	/internal/scanner
+	The core scanning logic (Usecases).
+	Orchestrates both live DB audits and static migration audits.
+	/internal/infra/postgres
+	DB access using pgx.8
+	Isolated from the logic, allowing for easier pooling.
+	/internal/infra/git
+	Repository access using go-git.
+	Handles cloning and file system traversal.
+	/internal/infra/parser
+	SQL parsing logic using pg_query_go.
+	Converts SQL strings into structured ASTs for analysis.
+	3. Deep Dive: Database Configuration Interrogation
+The database is the primary attack surface. The scanner's responsibility is to interrogate PostgreSQL system catalogs to identify configurations that deviate from security best practices.14
+3.1. Row Level Security (RLS) Analysis
+3.1.1. Detecting Disabled RLS
+A critical vulnerability is a table in an exposed schema (like public) with RLS disabled. The scanner uses the pg_class catalog, specifically the relrowsecurity column, to identify these tables.17
+3.1.2. Analyzing Policy Permissiveness
+The scanner queries the pg_policy catalog to find "permissive" policies, such as those using USING (true) for the anon role.18
+3.2. Role-Based Access Control and Privilege Escalation
+The scanner interrogates pg_namespace and pg_default_acl to ensure the public schema and newly created objects do not grant excessive rights to unprivileged roles.19
+3.3. Function Security and RPC Exposure
+Functions defined with SECURITY DEFINER are audited for secure search_path settings to prevent privilege escalation via hijacked execution flows.20
+4. Authentication and Management API Integration
+The scanner must utilize the Supabase Management API to audit high-level settings such as user signup confirmation, MFA enforcement, and rate limiting for sensitive endpoints.21
+5. Storage Security: Buckets and Objects
+The tool queries the storage.buckets table to identify buckets marked as public = true, which allows unauthenticated access to files, bypassing RLS.22
+6. Implementation Strategy: Developing the Go CLI
+6.1. Technology Stack and Libraries
+
+
+Component
+	Library
+	Justification
+	CLI Framework
+	spf13/cobra
+	Industry standard for Go CLIs.7
+	Git Operations
+	go-git/go-git/v5
+	Full Go implementation of Git; no CGO dependency required.
+	SQL Parser
+	pganalyze/pg_query_go
+	Uses the real PostgreSQL 16+ parser to generate reliable ASTs from SQL files.
+	Database Driver
+	jackc/pgx/v5
+	High-performance, pure Go PostgreSQL driver.8
+	Management API
+	supabase-community/supabase-go
+	Wrappers for Supabase project management.23
+	6.2. Designing the Scan Command
+The scan command is designed to be multi-modal. It can perform a "live" scan of a remote project or a "static" scan of a repository.
+
+
+Go
+
+
+
+
+// cmd/scan.go - Conceptual Design
+var scanCmd = &cobra.Command{
+   Use:   "scan [repo-url]",
+   Short: "Audit Supabase project security",
+   RunE: func(cmd *cobra.Command, argsstring) error {
+       // 1. Repository Access (if URL provided)
+       if len(args) > 0 {
+           repo, err := git.PlainClone("/tmp/scan", &git.CloneOptions{URL: args})
+           // logic to find /supabase/migrations directory
+       }
+
+       // 2. Static Analysis (Migration Files)
+       migrationScanner := scanner.NewMigrationScanner(infra.NewSQLParser())
+       results := migrationScanner.AnalyzeFiles("/tmp/scan/supabase/migrations")
+
+       // 3. Live Analysis (Database)
+       dbScanner := scanner.NewDatabaseScanner(infra.NewPostgresRepo(dbPool))
+       results.Append(dbScanner.ScanLive())
+
+       return reporter.Print(results)
+   },
+}
+
+7. Static Analysis of Infrastructure-as-Code: Auditing Migrations
+By connecting to the user's GitHub repository, the scanner gains access to the source of truth for the database schema. Migration files (typically found in supabase/migrations/) represent a chronological record of changes.
+7.1. Automated Repository Ingestion
+Using go-git, the tool can programmatically clone a repository into memory or a temporary directory using an OAuth token. This allows the tool to:
+1. Identify the presence of a Supabase configuration (supabase/config.toml).24
+2. Locate all .sql migration files.
+3. Cross-reference local settings with the live project configuration.
+7.2. AST-Based Vulnerability Detection
+Instead of simple string matching (grep), the tool utilizes pg_query_go to parse SQL into an AST. This allows for sophisticated "linting" of migrations:
+* Missing RLS: The scanner walks the AST to find CreateTableStmt nodes. It then checks if a corresponding AlterTableStmt with ENABLE ROW LEVEL SECURITY exists for that table within the migration history.
+* Overly Permissive Policies: It identifies CreatePolicyStmt nodes where the roles list contains PUBLIC or anon and the using_expression is a simple BooleanTest of TRUE.25
+* Dangerous Privileges: It flags GrantStmt nodes that grant ALL privileges on tables in the public schema to unauthenticated roles.27
+* Insecure Security Definers: It detects function definitions with the SECURITY DEFINER attribute that lack a SET search_path = '' or similar hardening clause.
+7.3. Linter Integration and Squawk
+The scanner can incorporate specialized tools like Squawk, an open-source linter for PostgreSQL migrations. Squawk can be used to identify common performance and security pitfalls (e.g., adding a NOT NULL column without a default to a large table) before the code is even committed to the main branch.
+8. Conclusion
+The security of a Supabase application is defined by the intersection of database configuration, API management, and the migration code stored in Git. While the platform secures the infrastructure, the developer is responsible for the data. The vulnerability scanner proposed here provides a holistic defense by combining live interrogation of system catalogs with deep static analysis of the repository. By leveraging Go's robust ecosystem—specifically pgx for database connectivity, go-git for repository access, and pg_query_go for SQL parsing—the tool ensures that security is baked into the development lifecycle from the first migration to the production deployment.
+Works cited
+1. Auth | Supabase Docs, accessed February 3, 2026, https://supabase.com/docs/guides/auth
+2. supabase-community/supabase-go: A Go Client library for Supabase - GitHub, accessed February 3, 2026, https://github.com/supabase-community/supabase-go
+3. Supabase Security Suite, accessed February 3, 2026, https://supabase.com/blog/hardening-supabase
+4. Row Level Security | Supabase Docs, accessed February 3, 2026, https://supabase.com/docs/guides/database/postgres/row-level-security
+5. Hacking Thousands of Misconfigured Supabase Instances - DeepStrike, accessed February 3, 2026, https://deepstrike.io/blog/hacking-thousands-of-misconfigured-supabase-instances-at-scale
+6. Hacking Moltbook: AI Social Network Reveals 1.5M API Keys | Wiz Blog, accessed February 3, 2026, https://www.wiz.io/blog/exposed-moltbook-database-reveals-millions-of-api-keys
+7. Structuring Go Code for CLI Applications - ByteSizeGo, accessed February 3, 2026, https://www.bytesizego.com/blog/structure-go-cli-app
+8. Working with PostgreSQL in Go using pgx - donchev.is, accessed February 3, 2026, https://donchev.is/post/working-with-postgresql-in-go-using-pgx/
+9. cmparrela/go-clean-architecture: Clean architecture example using golang, this project exemplifies the use of clean arch with more than one type of communication and more than one way of data persistence - GitHub, accessed February 3, 2026, https://github.com/cmparrela/go-clean-architecture
+10. Structuring a Go Project with Clean Architecture — A Practical Example - DEV Community, accessed February 3, 2026, https://dev.to/kittipat1413/structuring-a-go-project-with-clean-architecture-a-practical-example-3b3f
+11. The best example of a clean architecture on Go REST API : r/golang - Reddit, accessed February 3, 2026, https://www.reddit.com/r/golang/comments/1cncofn/the_best_example_of_a_clean_architecture_on_go/
+12. Cobra API: Building Modern CLI Applications with Subcommands in Go - Medium, accessed February 3, 2026, https://medium.com/@bless2k/cobra-api-building-modern-cli-applications-with-subcommands-in-go-b23c779ce25f
+13. Getting Started with PostgreSQL in Go using PGX | Better Stack Community, accessed February 3, 2026, https://betterstack.com/community/guides/scaling-go/postgresql-pgx-golang/
+14. Documentation: 18: Chapter 52. System Catalogs - PostgreSQL, accessed February 3, 2026, https://www.postgresql.org/docs/current/catalogs.html
+15. Use system catalogs and system views in PostgreSQL - Training | Microsoft Learn, accessed February 3, 2026, https://learn.microsoft.com/en-us/training/modules/use-system-catalogs-system-views-postgresql/
+16. Integrating golang with supabase - Reddit, accessed February 3, 2026, https://www.reddit.com/r/golang/comments/1k06vvb/integrating_golang_with_supabase/
+17. Enable RLS by default on all new tables · supabase · Discussion #21747 - GitHub, accessed February 3, 2026, https://github.com/orgs/supabase/discussions/21747
+18. How to get a list of Row Policies in PostgreSQL? - Stack Overflow, accessed February 3, 2026, https://stackoverflow.com/questions/38104160/how-to-get-a-list-of-row-policies-in-postgresql
+19. How to manage DEFAULT PRIVILEGES for USERs on a DATABASE vs SCHEMA?, accessed February 3, 2026, https://dba.stackexchange.com/questions/117109/how-to-manage-default-privileges-for-users-on-a-database-vs-schema
+20. Abusing SECURITY DEFINER functions in PostgreSQL, accessed February 3, 2026, https://www.cybertec-postgresql.com/en/abusing-security-definer-functions/
+21. Supabase API (v1), accessed February 3, 2026, https://api.supabase.com/api/v1
+22. Storage Buckets | Supabase Docs, accessed February 3, 2026, https://supabase.com/docs/guides/storage/buckets/fundamentals
+23. supabase package - github.com/supabase-community/supabase-go - Go Packages, accessed February 3, 2026, https://pkg.go.dev/github.com/supabase-community/supabase-go
+24. Local development with schema migrations | Supabase Docs, accessed February 3, 2026, https://supabase.com/docs/guides/local-development/overview
+25. Performance and Security Advisors | Supabase Docs, accessed February 3, 2026, https://supabase.com/docs/guides/database/database-advisors?lint=0006_multiple_permissive_policies
+26. supabase/create-rls-policies - Continue.dev, accessed February 3, 2026, https://continue.dev/supabase/create-rls-policies
+27. Show all privileges given to a schema or user in postgres, accessed February 3, 2026, https://dba.stackexchange.com/questions/270797/show-all-privileges-given-to-a-schema-or-user-in-postgres
+28. Postgres Roles and Privileges - Supabase, accessed February 3, 2026, https://supabase.com/blog/postgres-roles-and-privileges

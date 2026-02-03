@@ -1,7 +1,7 @@
 package main
 
 import (
-	"warden/cli/cmd"
+	cmd "warden/cli/cmd"
 )
 
 func main() {

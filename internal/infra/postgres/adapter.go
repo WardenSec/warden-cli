@@ -226,7 +226,7 @@ func (r *PostgresRepository) GetRoleGrants(ctx context.Context) ([]domain.RoleGr
 			table_name,
 			array_agg(privilege_type) as privileges
 		FROM information_schema.role_table_grants
-		WHERE grantee IN ('anon', 'authenticated')
+		WHERE grantee IN ('anon', 'authenticated', 'public')
 		AND table_schema = 'public'
 		GROUP BY grantee, table_schema, table_name;
 	`

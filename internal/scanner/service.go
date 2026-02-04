@@ -39,8 +39,15 @@ func (s *Scanner) isIgnored(id string) bool {
 	return false
 }
 
-func (s *Scanner) reportVulnerability(result *domain.ScanResult, id, title, desc, severity, location, remediation string) {
+// reportVulnerability adds a vulnerability if not suppressed.
+// suppressedIDs is optional (can be nil for live scans).
+func (s *Scanner) reportVulnerability(result *domain.ScanResult, suppressedIDs map[string]bool, id, title, desc, severity, location, remediation string) {
+	// Check global suppression (warden.yaml)
 	if s.isIgnored(id) {
+		return
+	}
+	// Check file-level suppression (-- warden-disable ID)
+	if suppressedIDs != nil && suppressedIDs[id] {
 		return
 	}
 
@@ -95,7 +102,7 @@ func (s *Scanner) scanLiveTables(ctx context.Context, result *domain.ScanResult)
 		return err
 	}
 	for _, table := range tables {
-		s.reportVulnerability(result, "RLS-001", "Row Level Security Disabled",
+		s.reportVulnerability(result, nil, "RLS-001", "Row Level Security Disabled",
 			fmt.Sprintf("Table %s has RLS disabled. This allows unrestricted access if policies are not enforced.", table),
 			"CRITICAL", table,
 			fmt.Sprintf("Enable RLS on table %s: ALTER TABLE %s ENABLE ROW LEVEL SECURITY;", table, table))
@@ -118,7 +125,7 @@ func (s *Scanner) scanLivePolicies(ctx context.Context, result *domain.ScanResul
 		}
 
 		if isPublic && p.Qual == "true" {
-			s.reportVulnerability(result, "POL-002", "Permissive Policy Detected (Live)",
+			s.reportVulnerability(result, nil, "POL-002", "Permissive Policy Detected (Live)",
 				fmt.Sprintf("Policy '%s' on table '%s.%s' allows access with USING (true) to public/anon roles.", p.Name, p.Schema, p.TableName),
 				"HIGH", fmt.Sprintf("%s.%s (%s)", p.Schema, p.TableName, p.Name),
 				"Review the policy. Ensure it restricts access to authorized users only.")
@@ -134,7 +141,7 @@ func (s *Scanner) scanLiveFunctions(ctx context.Context, result *domain.ScanResu
 	}
 	for _, f := range functions {
 		if f.SearchPath == "" || f.SearchPath != "search_path=" {
-			s.reportVulnerability(result, "FUNC-001", "Insecure SECURITY DEFINER Function",
+			s.reportVulnerability(result, nil, "FUNC-001", "Insecure SECURITY DEFINER Function",
 				fmt.Sprintf("Function '%s.%s' uses SECURITY DEFINER without a secure search_path. This can lead to privilege escalation.", f.Schema, f.Name),
 				"HIGH", fmt.Sprintf("%s.%s", f.Schema, f.Name),
 				"Add 'SET search_path = \"\"' to the function definition to prevent search_path hijacking.")
@@ -149,7 +156,7 @@ func (s *Scanner) scanLiveBuckets(ctx context.Context, result *domain.ScanResult
 		return err
 	}
 	for _, b := range buckets {
-		s.reportVulnerability(result, "STOR-001", "Public Storage Bucket",
+		s.reportVulnerability(result, nil, "STOR-001", "Public Storage Bucket",
 			fmt.Sprintf("Bucket '%s' is configured as public. Anyone can read objects from this bucket.", b.Name),
 			"MEDIUM", fmt.Sprintf("storage.buckets.%s", b.Name),
 			"Review if this bucket needs to be public. If not, set 'public' to false and use RLS policies for access control.")
@@ -172,7 +179,7 @@ func (s *Scanner) scanLiveStoragePolicies(ctx context.Context, result *domain.Sc
 		}
 
 		if isPublic && p.Qual == "true" {
-			s.reportVulnerability(result, "STOR-002", "Permissive Storage Policy",
+			s.reportVulnerability(result, nil, "STOR-002", "Permissive Storage Policy",
 				fmt.Sprintf("Policy '%s' on storage.objects allows unrestricted access to bucket '%s' with USING (true).", p.Name, p.BucketID),
 				"HIGH", fmt.Sprintf("storage.objects (%s)", p.Name),
 				"Restrict the policy to specific users or conditions instead of USING (true).")
@@ -186,15 +193,39 @@ func (s *Scanner) scanLiveGrants(ctx context.Context, result *domain.ScanResult)
 	if err != nil {
 		return err
 	}
-	dangerousPrivileges := map[string]bool{"TRUNCATE": true, "REFERENCES": true, "ALL": true}
+
 	for _, g := range roleGrants {
 		for _, priv := range g.Privileges {
-			if dangerousPrivileges[priv] {
-				s.reportVulnerability(result, "PRIV-001", "Dangerous Role Grant",
-					fmt.Sprintf("Role '%s' has %s privilege on table '%s.%s'. This could allow data destruction or privilege escalation.", g.Role, priv, g.Schema, g.TableName),
+			priv = strings.ToUpper(priv)
+			isAnonOrPublic := g.Role == "anon" || g.Role == "public"
+
+			// Check 1: TRUNCATE is always dangerous for these roles
+			if priv == "TRUNCATE" {
+				s.reportVulnerability(result, nil, "PRIV-001", "Dangerous Role Grant",
+					fmt.Sprintf("Role '%s' has TRUNCATE privilege on table '%s.%s'. This allows data destruction.", g.Role, g.Schema, g.TableName),
+					"CRITICAL", fmt.Sprintf("%s.%s (role: %s)", g.Schema, g.TableName, g.Role),
+					fmt.Sprintf("Revoke TRUNCATE privilege from role '%s'.", g.Role))
+				// We can continue to check other privileges, but usually one finding per table/role is enough to alert.
+				// The previous code broke here. Let's break to avoid noise.
+				break
+			}
+
+			// Check 2: REFERENCES is dangerous (blocks schema changes)
+			if priv == "REFERENCES" {
+				s.reportVulnerability(result, nil, "PRIV-001", "Dangerous Role Grant",
+					fmt.Sprintf("Role '%s' has REFERENCES privilege on table '%s.%s'. This can prevent schema changes.", g.Role, g.Schema, g.TableName),
 					"HIGH", fmt.Sprintf("%s.%s (role: %s)", g.Schema, g.TableName, g.Role),
-					fmt.Sprintf("Review if %s privilege is necessary for role '%s'. Consider revoking dangerous privileges.", priv, g.Role))
-				break // Only report once per table/role combination
+					fmt.Sprintf("Revoke REFERENCES privilege from role '%s'.", g.Role))
+				break
+			}
+
+			// Check 3: Write access (INSERT/UPDATE/DELETE) for anon/public
+			if isAnonOrPublic && (priv == "INSERT" || priv == "UPDATE" || priv == "DELETE") {
+				s.reportVulnerability(result, nil, "PRIV-001", "Dangerous Live Role Grant",
+					fmt.Sprintf("Role '%s' has %s privilege on table '%s.%s'. Anonymous/Public users should not have direct write access.", g.Role, priv, g.Schema, g.TableName),
+					"CRITICAL", fmt.Sprintf("%s.%s (role: %s)", g.Schema, g.TableName, g.Role),
+					fmt.Sprintf("Revoke %s privilege from role '%s'. Use RLS or Edge Functions for controlled access.", priv, g.Role))
+				break
 			}
 		}
 	}
@@ -222,7 +253,7 @@ func (s *Scanner) ScanStatic(ctx context.Context, repoURL string, migrationsPath
 	result := &domain.ScanResult{}
 
 	// Create temp dir
-	tmpDir, err := ioutil.TempDir("", "warden-scan")
+	tmpDir, err := os.MkdirTemp("", "warden-scan")
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +288,7 @@ func (s *Scanner) ScanStatic(ctx context.Context, repoURL string, migrationsPath
 }
 
 func (s *Scanner) processMigrationFile(file string, scanCtx *staticScanContext, result *domain.ScanResult) error {
-	content, err := ioutil.ReadFile(file)
+	content, err := os.ReadFile(file)
 	if err != nil {
 		return err
 	}
@@ -326,12 +357,10 @@ func (s *Scanner) analyzeCreateTable(stmt *pg_query.CreateStmt, scanCtx *staticS
 				if str := name.GetString_(); str != nil {
 					typeName := strings.ToLower(str.Sval)
 					if typeName == "serial" || typeName == "bigserial" || typeName == "serial4" || typeName == "serial8" {
-						if !scanCtx.suppressedIDs["INFO-001"] {
-							s.reportVulnerability(result, "INFO-001", "Incremental ID Detected",
-								fmt.Sprintf("Column '%s' in table '%s' uses %s. Incremental IDs can leak business metrics and enable data scraping.", colDef.Colname, fullName, strings.ToUpper(typeName)),
-								"LOW", fmt.Sprintf("%s.%s in %s", fullName, colDef.Colname, scanCtx.currentFile),
-								"Consider using UUID primary keys instead: 'id uuid PRIMARY KEY DEFAULT gen_random_uuid()'.")
-						}
+						s.reportVulnerability(result, scanCtx.suppressedIDs, "INFO-001", "Incremental ID Detected",
+							fmt.Sprintf("Column '%s' in table '%s' uses %s. Incremental IDs can leak business metrics and enable data scraping.", colDef.Colname, fullName, strings.ToUpper(typeName)),
+							"LOW", fmt.Sprintf("%s.%s in %s", fullName, colDef.Colname, scanCtx.currentFile),
+							"Consider using UUID primary keys instead: 'id uuid PRIMARY KEY DEFAULT gen_random_uuid()'.")
 					}
 				}
 			}
@@ -380,12 +409,10 @@ func (s *Scanner) analyzeCreateFunction(stmt *pg_query.CreateFunctionStmt, scanC
 				funcName = str.Sval
 			}
 		}
-		if !scanCtx.suppressedIDs["FUNC-002"] {
-			s.reportVulnerability(result, "FUNC-002", "Insecure SECURITY DEFINER Function (Static)",
-				fmt.Sprintf("Function '%s' uses SECURITY DEFINER without SET search_path.", funcName),
-				"HIGH", fmt.Sprintf("%s in %s", funcName, scanCtx.currentFile),
-				"Add 'SET search_path = \"\"' to the function definition.")
-		}
+		s.reportVulnerability(result, scanCtx.suppressedIDs, "FUNC-002", "Insecure SECURITY DEFINER Function (Static)",
+			fmt.Sprintf("Function '%s' uses SECURITY DEFINER without SET search_path.", funcName),
+			"HIGH", fmt.Sprintf("%s in %s", funcName, scanCtx.currentFile),
+			"Add 'SET search_path = \"\"' to the function definition.")
 	}
 }
 
@@ -395,23 +422,19 @@ func (s *Scanner) analyzeGrant(stmt *pg_query.GrantStmt, scanCtx *staticScanCont
 			roleName := rs.GetRolename()
 			if roleName == "anon" || roleName == "authenticated" {
 				if len(stmt.Privileges) == 0 {
-					if !scanCtx.suppressedIDs["PRIV-001"] {
-						s.reportVulnerability(result, "PRIV-001", "Dangerous Grant (Static)",
-							fmt.Sprintf("GRANT ALL to '%s' detected. This could allow data destruction or privilege escalation.", roleName),
-							"HIGH", scanCtx.currentFile,
-							fmt.Sprintf("Review if ALL privilege is necessary for role '%s'. Grant only specific required privileges.", roleName))
-					}
+					s.reportVulnerability(result, scanCtx.suppressedIDs, "PRIV-001", "Dangerous Grant (Static)",
+						fmt.Sprintf("GRANT ALL to '%s' detected. This could allow data destruction or privilege escalation.", roleName),
+						"HIGH", scanCtx.currentFile,
+						fmt.Sprintf("Review if ALL privilege is necessary for role '%s'. Grant only specific required privileges.", roleName))
 				} else {
 					for _, priv := range stmt.Privileges {
 						if accessPriv := priv.GetAccessPriv(); accessPriv != nil {
 							privName := strings.ToUpper(accessPriv.PrivName)
 							if privName == "TRUNCATE" || privName == "REFERENCES" {
-								if !scanCtx.suppressedIDs["PRIV-001"] {
-									s.reportVulnerability(result, "PRIV-001", "Dangerous Grant (Static)",
-										fmt.Sprintf("GRANT %s to '%s' detected. This could allow data destruction or privilege escalation.", privName, roleName),
-										"HIGH", scanCtx.currentFile,
-										fmt.Sprintf("Review if %s privilege is necessary for role '%s'.", privName, roleName))
-								}
+								s.reportVulnerability(result, scanCtx.suppressedIDs, "PRIV-001", "Dangerous Grant (Static)",
+									fmt.Sprintf("GRANT %s to '%s' detected. This could allow data destruction or privilege escalation.", privName, roleName),
+									"HIGH", scanCtx.currentFile,
+									fmt.Sprintf("Review if %s privilege is necessary for role '%s'.", privName, roleName))
 							}
 						}
 					}
@@ -454,12 +477,10 @@ func (s *Scanner) analyzeCreatePolicy(stmt *pg_query.CreatePolicyStmt, scanCtx *
 		}
 
 		if isPermissive {
-			if !scanCtx.suppressedIDs["POL-003"] {
-				s.reportVulnerability(result, "POL-003", "Permissive Policy Detected (Static)",
-					fmt.Sprintf("Policy '%s' allows access with USING (true) to public/anon roles.", stmt.PolicyName),
-					"HIGH", fmt.Sprintf("%s in %s", stmt.PolicyName, scanCtx.currentFile),
-					"Review the policy definition. Ensure it restricts access to authorized users only.")
-			}
+			s.reportVulnerability(result, scanCtx.suppressedIDs, "POL-003", "Permissive Policy Detected (Static)",
+				fmt.Sprintf("Policy '%s' allows access with USING (true) to public/anon roles.", stmt.PolicyName),
+				"HIGH", fmt.Sprintf("%s in %s", stmt.PolicyName, scanCtx.currentFile),
+				"Review the policy definition. Ensure it restricts access to authorized users only.")
 		}
 	}
 }
@@ -467,7 +488,7 @@ func (s *Scanner) analyzeCreatePolicy(stmt *pg_query.CreatePolicyStmt, scanCtx *
 func (s *Scanner) checkMissingRLS(scanCtx *staticScanContext, result *domain.ScanResult) {
 	for tableName, createdInFile := range scanCtx.tablesCreated {
 		if !scanCtx.tablesWithRLS[tableName] && !scanCtx.tablesSuppressedRLS[tableName] {
-			s.reportVulnerability(result, "RLS-002", "Missing RLS (Static)",
+			s.reportVulnerability(result, scanCtx.suppressedIDs, "RLS-002", "Missing RLS (Static)",
 				fmt.Sprintf("Table '%s' was created but RLS was never enabled in migrations.", tableName),
 				"CRITICAL", fmt.Sprintf("%s (created in %s)", tableName, createdInFile),
 				fmt.Sprintf("Add 'ALTER TABLE %s ENABLE ROW LEVEL SECURITY;' to your migrations.", tableName))
@@ -489,7 +510,7 @@ func (s *Scanner) checkEnvSecrets(tmpDir string, result *domain.ScanResult) {
 			contentStr := string(content)
 			for _, pattern := range secretPatterns {
 				if matches := pattern.FindAllString(contentStr, -1); len(matches) > 0 {
-					s.reportVulnerability(result, "LEAK-001", "Service Role Key Leaked",
+					s.reportVulnerability(result, nil, "LEAK-001", "Service Role Key Leaked",
 						fmt.Sprintf("Found potential service role key in '%s'. This key should NEVER be committed to source control.", envFile),
 						"CRITICAL", envFile,
 						"Remove the service role key from version control. Use environment variables or secret management. Add the file to .gitignore.")
@@ -511,7 +532,7 @@ func (s *Scanner) ScanAPI(ctx context.Context, projectRef, accessToken string) (
 
 	// Check 1: Email confirmation disabled
 	if !settings.EmailConfirmRequired {
-		s.reportVulnerability(result, "AUTH-001", "Email Confirmation Disabled",
+		s.reportVulnerability(result, nil, "AUTH-001", "Email Confirmation Disabled",
 			"Email confirmation is not required for new signups. This allows anyone to create accounts with unverified email addresses.",
 			"MEDIUM", fmt.Sprintf("Project: %s", projectRef),
 			"Enable email confirmation in Authentication > Settings > Email Auth.")
@@ -519,7 +540,7 @@ func (s *Scanner) ScanAPI(ctx context.Context, projectRef, accessToken string) (
 
 	// Check 2: Phone confirmation disabled (if phone auth is used)
 	if !settings.PhoneConfirmRequired {
-		s.reportVulnerability(result, "AUTH-002", "Phone Confirmation Disabled",
+		s.reportVulnerability(result, nil, "AUTH-002", "Phone Confirmation Disabled",
 			"Phone confirmation is not required. This allows signups with unverified phone numbers.",
 			"LOW", fmt.Sprintf("Project: %s", projectRef),
 			"Enable phone confirmation in Authentication > Settings > Phone Auth.")
@@ -527,7 +548,7 @@ func (s *Scanner) ScanAPI(ctx context.Context, projectRef, accessToken string) (
 
 	// Check 3: Anonymous users enabled
 	if settings.AnonymousUsersEnabled {
-		s.reportVulnerability(result, "AUTH-003", "Anonymous Users Enabled",
+		s.reportVulnerability(result, nil, "AUTH-003", "Anonymous Users Enabled",
 			"Anonymous authentication is enabled. Ensure your RLS policies properly handle anonymous users.",
 			"LOW", fmt.Sprintf("Project: %s", projectRef),
 			"If anonymous users are not needed, disable them in Authentication > Settings.")
@@ -535,7 +556,7 @@ func (s *Scanner) ScanAPI(ctx context.Context, projectRef, accessToken string) (
 
 	// Check 4: MFA not enabled (informational)
 	if !settings.MFAEnabled {
-		s.reportVulnerability(result, "MFA-001", "MFA Not Enabled",
+		s.reportVulnerability(result, nil, "MFA-001", "MFA Not Enabled",
 			"Multi-factor authentication is not enabled. Consider enabling MFA for enhanced security.",
 			"LOW", fmt.Sprintf("Project: %s", projectRef),
 			"Enable MFA in Authentication > Settings > Multi-Factor Authentication.")
@@ -584,7 +605,7 @@ func (s *Scanner) ScanEdgeFunctions(ctx context.Context, repoURL string, functio
 		// EDGE-001: Check for hardcoded secrets
 		for _, pattern := range secretPatterns {
 			if matches := pattern.FindAllString(contentStr, -1); len(matches) > 0 {
-				s.reportVulnerability(result, "EDGE-001", "Potential Hardcoded Secret",
+				s.reportVulnerability(result, nil, "EDGE-001", "Potential Hardcoded Secret",
 					fmt.Sprintf("Potential hardcoded secret detected in edge function. Pattern matched: %s", pattern.String()),
 					"CRITICAL", file,
 					"Store secrets in environment variables or Supabase Vault. Never commit secrets to source code.")
@@ -601,7 +622,7 @@ func (s *Scanner) ScanEdgeFunctions(ctx context.Context, repoURL string, functio
 			strings.Contains(contentStr, "createClient")
 
 		if hasServeFunction && !hasAuthCheck {
-			s.reportVulnerability(result, "EDGE-002", "Missing Authorization Header Validation",
+			s.reportVulnerability(result, nil, "EDGE-002", "Missing Authorization Header Validation",
 				"Edge function handler does not appear to validate the Authorization header. This could allow unauthorized access.",
 				"HIGH", file,
 				"Verify the 'Authorization' header or create a Supabase client to validate the user token.")

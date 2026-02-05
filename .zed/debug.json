@@ -1,0 +1,14 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  {
+    "adapter": "Delve",
+    "request": "launch",
+    "label": "Debug (Local Test Repo)",
+    "mode": "debug",
+    "program": ".",
+    "args": ["scan", "--repo", "/home/riad/src/auto-unity-hub"],
+  },
+]

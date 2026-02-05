@@ -233,9 +233,6 @@ func (s *Scanner) scanLiveGrants(ctx context.Context, result *domain.ScanResult)
 					fmt.Sprintf("Role '%s' has TRUNCATE privilege on table '%s.%s'. This allows data destruction.", g.Role, g.Schema, g.TableName),
 					"CRITICAL", fmt.Sprintf("%s.%s (role: %s)", g.Schema, g.TableName, g.Role),
 					fmt.Sprintf("Revoke TRUNCATE privilege from role '%s'.", g.Role))
-				// We can continue to check other privileges, but usually one finding per table/role is enough to alert.
-				// The previous code broke here. Let's break to avoid noise.
-				break
 			}
 
 			// Check 2: REFERENCES is dangerous (blocks schema changes)
@@ -244,7 +241,6 @@ func (s *Scanner) scanLiveGrants(ctx context.Context, result *domain.ScanResult)
 					fmt.Sprintf("Role '%s' has REFERENCES privilege on table '%s.%s'. This can prevent schema changes.", g.Role, g.Schema, g.TableName),
 					"HIGH", fmt.Sprintf("%s.%s (role: %s)", g.Schema, g.TableName, g.Role),
 					fmt.Sprintf("Revoke REFERENCES privilege from role '%s'.", g.Role))
-				break
 			}
 
 			// Check 3: Write access (INSERT/UPDATE/DELETE) for anon/public
@@ -253,7 +249,6 @@ func (s *Scanner) scanLiveGrants(ctx context.Context, result *domain.ScanResult)
 					fmt.Sprintf("Role '%s' has %s privilege on table '%s.%s'. Anonymous/Public users should not have direct write access.", g.Role, priv, g.Schema, g.TableName),
 					"CRITICAL", fmt.Sprintf("%s.%s (role: %s)", g.Schema, g.TableName, g.Role),
 					fmt.Sprintf("Revoke %s privilege from role '%s'. Use RLS or Edge Functions for controlled access.", priv, g.Role))
-				break
 			}
 		}
 	}

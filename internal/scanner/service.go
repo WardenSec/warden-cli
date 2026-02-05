@@ -139,12 +139,40 @@ func (s *Scanner) scanLiveFunctions(ctx context.Context, result *domain.ScanResu
 	if err != nil {
 		return err
 	}
+
 	for _, f := range functions {
-		if f.SearchPath == "" || f.SearchPath != "search_path=" {
+		isVulnerable := false
+
+		// Case 1: Search Path is completely missing (Inherits environment -> Unsafe)
+		if f.SearchPath == "" {
+			isVulnerable = true
+		} else {
+			// Case 2: Search Path is present, check if it includes 'public'
+			// Format from Postgres is usually "search_path=value, value2"
+			parts := strings.SplitN(f.SearchPath, "=", 2)
+			if len(parts) == 2 {
+				pathValue := parts[1] // e.g. "public, extensions" or "" or "pg_temp"
+				// fmt.Println(pathValue)
+				// Split by comma to handle multiple schemas
+				schemas := strings.Split(pathValue, ",")
+				for _, schema := range schemas {
+					// Clean up the string (trim spaces, quotes, and normalize case)
+					cleanSchema := strings.TrimSpace(schema)
+					cleanSchema = strings.Trim(cleanSchema, "\"") // Handle quoted "public"
+
+					if strings.ToLower(cleanSchema) == "public" {
+						isVulnerable = true
+						break
+					}
+				}
+			}
+		}
+
+		if isVulnerable {
 			s.reportVulnerability(result, nil, "FUNC-001", "Insecure SECURITY DEFINER Function",
-				fmt.Sprintf("Function '%s.%s' uses SECURITY DEFINER without a secure search_path. This can lead to privilege escalation.", f.Schema, f.Name),
+				fmt.Sprintf("Function '%s.%s' is SECURITY DEFINER but includes 'public' in search_path.", f.Schema, f.Name),
 				"HIGH", fmt.Sprintf("%s.%s", f.Schema, f.Name),
-				"Add 'SET search_path = \"\"' to the function definition to prevent search_path hijacking.")
+				"Add 'SET search_path = \"\"' (or a specific secure schema like 'pg_temp') to the function definition.")
 		}
 	}
 	return nil

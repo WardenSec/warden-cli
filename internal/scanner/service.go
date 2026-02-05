@@ -390,29 +390,72 @@ func (s *Scanner) analyzeCreateFunction(stmt *pg_query.CreateFunctionStmt, scanC
 	hasSecureSearchPath := false
 
 	for _, option := range stmt.Options {
-		if defElem := option.GetDefElem(); defElem != nil {
-			if defElem.Defname == "security" {
-				if boolVal := defElem.Arg.GetBoolean(); boolVal != nil {
-					isSecurityDefiner = boolVal.Boolval
-				}
+		defElem := option.GetDefElem()
+		if defElem == nil {
+			continue
+		}
+
+		// 1. Check for SECURITY DEFINER
+		if defElem.Defname == "security" {
+			if boolVal := defElem.Arg.GetBoolean(); boolVal != nil {
+				isSecurityDefiner = boolVal.Boolval
 			}
-			if defElem.Defname == "set" {
-				hasSecureSearchPath = true
+		}
+
+		// 2. Check for SET search_path
+		if defElem.Defname == "set" {
+			if variableSet := defElem.Arg.GetVariableSetStmt(); variableSet != nil {
+				// Fix B: Handle case-insensitive SQL
+				if strings.ToLower(variableSet.Name) == "search_path" {
+
+					// Assume safe until proven otherwise
+					isSafePath := true
+
+					for _, arg := range variableSet.Args {
+						if aConst := arg.GetAConst(); aConst != nil {
+							if str := aConst.GetSval(); str != nil {
+								val := strings.ToLower(str.Sval)
+
+								// Fix C: Split by comma to handle "public, admin" in a single string
+								// AND avoid partial matches like "republic" or "publication"
+								schemas := strings.Split(val, ",")
+								for _, schema := range schemas {
+									cleanedSchema := strings.TrimSpace(schema)
+									if cleanedSchema == "public" {
+										isSafePath = false
+										break
+									}
+								}
+							}
+						}
+						if !isSafePath {
+							break
+						}
+					}
+
+					// Logic: If we found a search_path config, we accept the result of our scan
+					hasSecureSearchPath = isSafePath
+				}
 			}
 		}
 	}
 
 	if isSecurityDefiner && !hasSecureSearchPath {
 		funcName := ""
+		// Join function name parts (e.g. schema.funcname)
+		var nameParts []string
 		for _, part := range stmt.Funcname {
 			if str := part.GetString_(); str != nil {
-				funcName = str.Sval
+				nameParts = append(nameParts, str.Sval)
 			}
 		}
-		s.reportVulnerability(result, scanCtx.suppressedIDs, "FUNC-002", "Insecure SECURITY DEFINER Function (Static)",
-			fmt.Sprintf("Function '%s' uses SECURITY DEFINER without SET search_path.", funcName),
+		funcName = strings.Join(nameParts, ".")
+
+		s.reportVulnerability(result, scanCtx.suppressedIDs, "FUNC-002",
+			"Insecure SECURITY DEFINER Function (Static)",
+			fmt.Sprintf("Function '%s' is SECURITY DEFINER but allows access to 'public' schema.", funcName),
 			"HIGH", fmt.Sprintf("%s in %s", funcName, scanCtx.currentFile),
-			"Add 'SET search_path = \"\"' to the function definition.")
+			"Add 'SET search_path = pg_temp' (or exclude public) to the function options.")
 	}
 }
 
